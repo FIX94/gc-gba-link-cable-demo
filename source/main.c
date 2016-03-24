@@ -71,7 +71,39 @@ void endproc()
 	printf("GC Button pressed, exit\n");
 	exit(0);
 }
+unsigned int calckey(unsigned int size)
+{
+	unsigned int ret = 0;
+	size=(size-0x200) >> 3;
+	int res1 = (size&0x3F80) << 1;
+	res1 |= (size&0x4000) << 2;
+	res1 |= (size&0x7F);
+	res1 |= 0x380000;
+	int res2 = res1;
+	res1 = res2 >> 0x10;
+	int res3 = res2 >> 8;
+	res3 += res1;
+	res3 += res2;
+	res3 <<= 24;
+	res3 |= res2;
+	res3 |= 0x80808080;
 
+	if((res3&0x200) == 0)
+	{
+		ret |= (((res3)&0xFF)^0x4B)<<24;
+		ret |= (((res3>>8)&0xFF)^0x61)<<16;
+		ret |= (((res3>>16)&0xFF)^0x77)<<8;
+		ret |= (((res3>>24)&0xFF)^0x61);
+	}
+	else
+	{
+		ret |= (((res3)&0xFF)^0x73)<<24;
+		ret |= (((res3>>8)&0xFF)^0x65)<<16;
+		ret |= (((res3>>16)&0xFF)^0x64)<<8;
+		ret |= (((res3>>24)&0xFF)^0x6F);
+	}
+	return ret;
+}
 int main(int argc, char *argv[]) 
 {
 	void *xfb = NULL;
@@ -138,6 +170,9 @@ int main(int argc, char *argv[])
 				wait_for_transfer();
 			}
 			printf("Ready, sending input stub\n");
+			unsigned int sendsize = ((gba_mb_gba_size+7)&~7);
+			unsigned int ourkey = calckey(sendsize);
+			printf("Our Key: %08x\n", ourkey);
 			//get current sessionkey
 			memset(resbuf,0,32);
 			cmdbuf[0]=0x14; //read
@@ -146,7 +181,7 @@ int main(int argc, char *argv[])
 			wait_for_transfer();
 			u32 sessionkey = (resbuf[3]^0x6F)<<24|(resbuf[2]^0x64)<<16|(resbuf[1]^0x65)<<8|(resbuf[0]^0x73);
 			//send over our own key
-			cmdbuf[0]=0x15;cmdbuf[1]=0xdb;cmdbuf[2]=0x94;cmdbuf[3]=0xcf;cmdbuf[4]=0xdc;
+			cmdbuf[0]=0x15;cmdbuf[1]=(ourkey>>24)&0xFF;cmdbuf[2]=(ourkey>>16)&0xFF;cmdbuf[3]=(ourkey>>8)&0xFF;cmdbuf[4]=ourkey&0xFF;
 			transval = 0;
 			SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,0);
 			wait_for_transfer();
@@ -162,7 +197,7 @@ int main(int argc, char *argv[])
 				if(!(resbuf[0]&0x2)) printf("Possible error %02x\n",resbuf[0]);
 			}
 			printf("Header done! Sending ROM...\n");
-			for(i = 0xC0; i < gba_mb_gba_size; i+=4)
+			for(i = 0xC0; i < sendsize; i+=4)
 			{
 				u32 enc = ((gba_mb_gba[i+3]<<24)|(gba_mb_gba[i+2]<<16)|(gba_mb_gba[i+1]<<8)|(gba_mb_gba[i]));
 				fcrc=docrc(fcrc,enc);
@@ -177,7 +212,7 @@ int main(int argc, char *argv[])
 				wait_for_transfer();
 				if(!(resbuf[0]&0x2)) printf("Possible error %02x\n",resbuf[0]);
 			}
-			fcrc |= (gba_mb_gba_size<<16);
+			fcrc |= (sendsize<<16);
 			printf("ROM done! CRC: %08x\n", fcrc);
 			//send over CRC
 			sessionkey = (sessionkey*0x6177614B)+1;
