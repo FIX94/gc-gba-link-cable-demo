@@ -11,8 +11,10 @@
 #include <string.h>
 #include <stdlib.h>
 
-//For whatever reason this has to be a 0x1D680
-//buffer size or else the GBA just freezes up
+//from my tests 50us seems to be the lowest
+//safe si transfer delay in between calls
+#define SI_TRANS_DELAY 50
+
 extern u8 gba_mb_gba[];
 extern u32 gba_mb_gba_size;
 
@@ -28,7 +30,7 @@ void ctrlcb(s32 chan, u32 ret)
 	}
 	//just call us again
 	pads = (~((resbuf[1]<<8)|resbuf[0]))&0x3FF;
-	SI_Transfer(1,cmdbuf,1,resbuf,5,ctrlcb,350);
+	SI_Transfer(1,cmdbuf,1,resbuf,5,ctrlcb,SI_TRANS_DELAY);
 }
 
 volatile u32 transval = 0;
@@ -58,12 +60,6 @@ unsigned int docrc(u32 crc, u32 val)
 		val>>=1;
 	}
 	return crc;
-}
-
-static inline void wait_for_transfer()
-{
-	//350 is REALLY pushing it already, cant go further
-	do{ usleep(350); }while(transval == 0);
 }
 
 void endproc()
@@ -103,6 +99,38 @@ unsigned int calckey(unsigned int size)
 		ret |= (((res3>>24)&0xFF)^0x6F);
 	}
 	return ret;
+}
+void doreset()
+{
+	cmdbuf[0] = 0xFF; //reset
+	transval = 0;
+	SI_Transfer(1,cmdbuf,1,resbuf,3,transcb,SI_TRANS_DELAY);
+	while(transval == 0) ;
+}
+void getstatus()
+{
+	cmdbuf[0] = 0; //status
+	transval = 0;
+	SI_Transfer(1,cmdbuf,1,resbuf,3,transcb,SI_TRANS_DELAY);
+	while(transval == 0) ;
+}
+u32 recv()
+{
+	memset(resbuf,0,32);
+	cmdbuf[0]=0x14; //read
+	transval = 0;
+	SI_Transfer(1,cmdbuf,1,resbuf,5,transcb,SI_TRANS_DELAY);
+	while(transval == 0) ;
+	return *(vu32*)resbuf;
+}
+void send(u32 msg)
+{
+	cmdbuf[0]=0x15;cmdbuf[1]=(msg>>0)&0xFF;cmdbuf[2]=(msg>>8)&0xFF;
+	cmdbuf[3]=(msg>>16)&0xFF;cmdbuf[4]=(msg>>24)&0xFF;
+	transval = 0;
+	resbuf[0] = 0;
+	SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,SI_TRANS_DELAY);
+	while(transval == 0) ;
 }
 int main(int argc, char *argv[]) 
 {
@@ -160,40 +188,23 @@ int main(int argc, char *argv[])
 			resbuf[2]=0;
 			while(!(resbuf[2]&0x10))
 			{
-				cmdbuf[0] = 0xFF; //reset
-				transval = 0;
-				SI_Transfer(1,cmdbuf,1,resbuf,3,transcb,0);
-				wait_for_transfer();
-				cmdbuf[0] = 0; //status
-				transval = 0;
-				SI_Transfer(1,cmdbuf,1,resbuf,3,transcb,0);
-				wait_for_transfer();
+				doreset();
+				getstatus();
 			}
 			printf("Ready, sending input stub\n");
 			unsigned int sendsize = ((gba_mb_gba_size+7)&~7);
 			unsigned int ourkey = calckey(sendsize);
 			printf("Our Key: %08x\n", ourkey);
 			//get current sessionkey
-			memset(resbuf,0,32);
-			cmdbuf[0]=0x14; //read
-			transval = 0;
-			SI_Transfer(1,cmdbuf,1,resbuf,5,transcb,0);
-			wait_for_transfer();
-			u32 sessionkey = (resbuf[3]^0x6F)<<24|(resbuf[2]^0x64)<<16|(resbuf[1]^0x65)<<8|(resbuf[0]^0x73);
+			u32 sessionkeyraw = recv();
+			u32 sessionkey = __builtin_bswap32(sessionkeyraw^0x7365646F);
 			//send over our own key
-			cmdbuf[0]=0x15;cmdbuf[1]=(ourkey>>24)&0xFF;cmdbuf[2]=(ourkey>>16)&0xFF;cmdbuf[3]=(ourkey>>8)&0xFF;cmdbuf[4]=ourkey&0xFF;
-			transval = 0;
-			SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,0);
-			wait_for_transfer();
+			send(__builtin_bswap32(ourkey));
 			unsigned int fcrc = 0x15a0;
 			//send over gba header
 			for(i = 0; i < 0xC0; i+=4)
 			{
-				cmdbuf[0]=0x15;cmdbuf[1]=gba_mb_gba[i];cmdbuf[2]=gba_mb_gba[i+1];cmdbuf[3]=gba_mb_gba[i+2];cmdbuf[4]=gba_mb_gba[i+3];
-				transval = 0;
-				resbuf[0] = 0;
-				SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,0);
-				wait_for_transfer();
+				send(__builtin_bswap32(*(vu32*)(gba_mb_gba+i)));
 				if(!(resbuf[0]&0x2)) printf("Possible error %02x\n",resbuf[0]);
 			}
 			printf("Header done! Sending ROM...\n");
@@ -205,11 +216,7 @@ int main(int argc, char *argv[])
 				enc^=sessionkey;
 				enc^=((~(i+(0x20<<20)))+1);
 				enc^=0x20796220;
-				cmdbuf[0]=0x15;cmdbuf[1]=(enc>>0)&0xFF;cmdbuf[2]=(enc>>8)&0xFF;cmdbuf[3]=(enc>>16)&0xFF;cmdbuf[4]=(enc>>24)&0xFF;
-				transval = 0;
-				resbuf[0] = 0;
-				SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,0);
-				wait_for_transfer();
+				send(enc);
 				if(!(resbuf[0]&0x2)) printf("Possible error %02x\n",resbuf[0]);
 			}
 			fcrc |= (sendsize<<16);
@@ -219,17 +226,9 @@ int main(int argc, char *argv[])
 			fcrc^=sessionkey;
 			fcrc^=((~(i+(0x20<<20)))+1);
 			fcrc^=0x20796220;
-			cmdbuf[0]=0x15;cmdbuf[1]=(fcrc>>0)&0xFF;cmdbuf[2]=(fcrc>>8)&0xFF;cmdbuf[3]=(fcrc>>16)&0xFF;cmdbuf[4]=(fcrc>>24)&0xFF;
-			transval = 0;
-			resbuf[0] = 0;
-			SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,0);
-			wait_for_transfer();
+			send(fcrc);
 			//get crc back (unused)
-			memset(resbuf,0,32);
-			cmdbuf[0]=0x14; //read
-			transval = 0;
-			SI_Transfer(1,cmdbuf,1,resbuf,5,transcb,0);
-			wait_for_transfer();
+			recv();
 			//start read chain
 			cmdbuf[0] = 0x14; //read
 			transval = 0;
